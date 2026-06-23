@@ -1,0 +1,66 @@
+name: Bujairami stock monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bujairami-stock-monitor
+  cancel-in-progress: false
+
+jobs:
+  check-stock:
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright/python:v1.59.0-noble
+      options: --ipc=host
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      STATE_FILE: .github/stock-state.json
+      PAGE_TIMEOUT_MS: "45000"
+
+    steps:
+      - name: Download monitor
+        uses: actions/checkout@v4
+
+      - name: Install Python package
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Check FragranceNet
+        run: python monitor.py --once
+
+      - name: Prepare saved status
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path(".github/stock-state.json")
+          state = json.loads(path.read_text())
+          keys = (
+              "status",
+              "product_url",
+              "last_in_stock_alert",
+              "last_error_alert",
+              "consecutive_errors",
+              "detail",
+          )
+          saved = {key: state.get(key) for key in keys if key in state}
+          path.write_text(json.dumps(saved, indent=2, sort_keys=True) + "\n")
+          PY
+
+      - name: Save status
+        if: always()
+        run: |
+          git config user.name "stock-monitor[bot]"
+          git config user.email "stock-monitor@users.noreply.github.com"
+          git add .github/stock-state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update stock monitor state"
+            git push
+          fi
