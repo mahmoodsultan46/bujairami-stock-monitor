@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import signal
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,8 +32,21 @@ USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+HTTP_HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+}
+ANCHOR_RE = re.compile(r"<a\b[^>]*?href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", re.I | re.S)
+SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b.*?</\1>", re.I | re.S)
+TAG_RE = re.compile(r"<[^>]+>")
 
 STOP_REQUESTED = False
+
+
+class FragranceNetBlocked(RuntimeError):
+    """FragranceNet blocked the cloud checker before it could read the page."""
 
 
 def load_env_file() -> None:
@@ -69,6 +84,7 @@ def env_int(name: str, default: int, minimum: int) -> int:
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 300, 60)
 PAGE_TIMEOUT_MS = env_int("PAGE_TIMEOUT_MS", 45_000, 10_000)
 REMINDER_HOURS = env_int("REMINDER_HOURS", 6, 1)
+ERROR_REMINDER_HOURS = env_int("ERROR_REMINDER_HOURS", 1, 1)
 
 
 def utc_now() -> str:
@@ -149,27 +165,63 @@ def is_target_link(text: str, href: str) -> bool:
 
 def listing_urls() -> list[str]:
     # A newly released product should appear at the top of this sorted page.
-    # Keeping this to one request also avoids triggering the retailer's rate limit.
-    return [NEW_ARRIVALS_URL]
+    # The extra fallback URLs help when FragranceNet blocks one route.
+    return [
+        NEW_ARRIVALS_URL,
+        "https://www.fragrancenet.com/fragrances/bujairami?s=new",
+        BRAND_URL,
+        "https://www.fragrancenet.com/ni/fragrances/bujairami",
+    ]
+
+
+def fetch_html(url: str) -> tuple[str, str]:
+    request = urllib.request.Request(url, headers=HTTP_HEADERS)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            charset = response.headers.get_content_charset() or "utf-8"
+            return response.url, response.read().decode(charset, "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 403:
+            raise FragranceNetBlocked(f"FragranceNet blocked {url} with HTTP 403") from exc
+        detail = exc.read().decode("utf-8", "replace")[:300]
+        raise RuntimeError(f"FragranceNet returned HTTP {exc.code} for {url}: {detail}") from exc
+
+
+def extract_links(page_url: str, page_html: str) -> list[dict[str, str]]:
+    links: list[dict[str, str]] = []
+    for href, inner_html in ANCHOR_RE.findall(page_html):
+        clean_text = html.unescape(TAG_RE.sub(" ", inner_html))
+        clean_text = re.sub(r"\s+", " ", clean_text).strip()
+        absolute_href = urllib.parse.urljoin(page_url, html.unescape(href))
+        links.append({"text": clean_text, "href": absolute_href})
+    return links
+
+
+def page_text(page_html: str) -> str:
+    without_scripts = SCRIPT_STYLE_RE.sub(" ", page_html)
+    return html.unescape(TAG_RE.sub(" ", without_scripts))
 
 
 def load_page(page: Page, url: str) -> None:
     response = page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     if response and response.status >= 400:
+        if response.status == 403:
+            raise FragranceNetBlocked(f"FragranceNet blocked {url} with HTTP 403")
         raise RuntimeError(f"FragranceNet returned HTTP {response.status} for {url}")
     page.locator("body").wait_for(state="visible", timeout=PAGE_TIMEOUT_MS)
 
 
 def discover_product_url(page: Page) -> str | None:
+    blocked_urls: list[str] = []
     for url in listing_urls():
         logging.info("Looking for the product on %s", url)
-        load_page(page, url)
-        links: list[dict[str, str]] = page.locator("a[href]").evaluate_all(
-            """els => els.map(a => ({
-                text: (a.textContent || '').trim().replace(/\\s+/g, ' '),
-                href: a.href || ''
-            }))"""
-        )
+        try:
+            loaded_url, loaded_html = fetch_html(url)
+        except FragranceNetBlocked:
+            blocked_urls.append(url)
+            logging.warning("FragranceNet blocked %s; trying the next fallback.", url)
+            continue
+        links = extract_links(loaded_url, loaded_html)
         matches = [item for item in links if is_target_link(item["text"], item["href"])]
         if matches:
             # A detail/variant link is preferable to a brand-filter link.
@@ -181,10 +233,29 @@ def discover_product_url(page: Page) -> str | None:
                 )
             )
             return matches[0]["href"].split("?")[0]
+    if len(blocked_urls) == len(listing_urls()):
+        raise FragranceNetBlocked(
+            "FragranceNet blocked every fallback page with HTTP 403. The watcher will keep retrying."
+        )
     return None
 
 
 def product_is_in_stock(page: Page, product_url: str) -> tuple[bool, str]:
+    try:
+        loaded_url, loaded_html = fetch_html(product_url)
+        body_text = normalized(page_text(loaded_html))
+        if "add to bag" in body_text and "sold out" not in body_text:
+            return True, "The product page text includes “Add to Bag”."
+        sold_out_phrases = (
+            "we apologize we are currently sold out",
+            "currently sold out",
+            "out of stock",
+        )
+        if any(phrase in body_text for phrase in sold_out_phrases):
+            return False, "The product page says it is sold out."
+    except FragranceNetBlocked:
+        logging.warning("Plain page read was blocked for %s; trying browser mode.", product_url)
+
     load_page(page, product_url)
     add_buttons = page.get_by_role("button", name="Add to Bag", exact=True)
     if add_buttons.count() > 0:
@@ -267,16 +338,32 @@ def handle_error(state: dict[str, Any], webhook_url: str, exc: Exception, dry_ru
     state["consecutive_errors"] = int(state.get("consecutive_errors", 0)) + 1
     state["last_checked"] = utc_now()
     state["last_error"] = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, FragranceNetBlocked):
+        state["status"] = "temporarily_blocked"
+        state["detail"] = "FragranceNet is temporarily blocking the online checker."
     logging.exception("Check failed")
+    reminder_hours = ERROR_REMINDER_HOURS if isinstance(exc, FragranceNetBlocked) else REMINDER_HOURS
     if (
         state["consecutive_errors"] >= 3
-        and hours_since(state.get("last_error_alert")) >= REMINDER_HOURS
+        and hours_since(state.get("last_error_alert")) >= reminder_hours
         and not dry_run
     ):
+        if isinstance(exc, FragranceNetBlocked):
+            title = "⚠️ Stock watcher is being blocked"
+            description = (
+                "FragranceNet blocked the online checker with HTTP 403. "
+                "The watcher will keep retrying automatically, but it may miss stock while blocked."
+            )
+        else:
+            title = "⚠️ Stock watcher needs attention"
+            description = (
+                f"The last {state['consecutive_errors']} checks failed. "
+                f"Latest error: `{type(exc).__name__}: {exc}`"
+            )
         send_discord(
             webhook_url,
-            "⚠️ Stock watcher needs attention",
-            f"The last {state['consecutive_errors']} checks failed. Latest error: `{type(exc).__name__}: {exc}`",
+            title,
+            description,
             0xE74C3C,
         )
         state["last_error_alert"] = utc_now()
