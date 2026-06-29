@@ -1,8 +1,8 @@
 {
-  "consecutive_errors": 0,
-  "detail": "No matching FragranceNet listing found yet.",
+  "consecutive_errors": 1,
+  "detail": "FragranceNet is temporarily blocking the online checker.",
   "last_error_alert": "2026-06-27T08:10:18+00:00",
   "last_in_stock_alert": null,
   "product_url": "",
-  "status": "not_listed"
+  "status": "temporarily_blocked"
 }
