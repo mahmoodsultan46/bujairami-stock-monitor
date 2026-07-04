@@ -1,7 +1,7 @@
 {
-  "consecutive_errors": 15,
+  "consecutive_errors": 16,
   "detail": "FragranceNet is temporarily blocking the online checker.",
-  "last_error_alert": "2026-07-03T20:21:36+00:00",
+  "last_error_alert": "2026-07-04T00:16:48+00:00",
   "last_in_stock_alert": null,
   "product_url": "",
   "status": "temporarily_blocked"
